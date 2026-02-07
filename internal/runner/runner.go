@@ -74,6 +74,7 @@ func runOne(ctx context.Context, t tests.Task, client chclient.Client, queryTime
 		TaskID:      t.ID,
 		Name:        t.Name,
 		Description: t.Description,
+		Query:       t.Query,
 		Type:        t.Type,
 		Pass:        false,
 	}
@@ -100,6 +101,7 @@ func runOne(ctx context.Context, t tests.Task, client chclient.Client, queryTime
 			}
 			tr.ExplainText = explainText
 			tr.Granules = chclient.ExtractGranules(explainText)
+			tr.ProjectionUsed = chclient.ProjectionUsed(explainText)
 		}
 
 		start := time.Now()

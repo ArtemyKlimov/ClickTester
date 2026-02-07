@@ -13,32 +13,34 @@ import (
 	"clicktester/internal/tests"
 )
 
-// ReportMeta — метаданные для заголовка отчёта (опционально).
+// ReportMeta — метаданные для заголовка отчёта и JSON-экспорта.
 type ReportMeta struct {
-	GeneratedAt       string
-	Host               string
-	Database           string
-	Table              string
-	Workers            int
-	GranulesWarn       int
-	GranulesFail       int
-	ReadRowsWarn       int
+	GeneratedAt  string `json:"generated_at"`
+	Host         string `json:"host,omitempty"`
+	Database     string `json:"database,omitempty"`
+	Table        string `json:"table,omitempty"`
+	Workers      int    `json:"workers"`
+	GranulesWarn int    `json:"granules_warn"`
+	GranulesFail int    `json:"granules_fail"`
+	ReadRowsWarn int    `json:"read_rows_warn"`
 }
 
 // rowView — одна строка таблицы с вычисленным статусом (все поля — примитивы для шаблона).
 type rowView struct {
-	TaskID       int
-	Name         string
-	Description  string
-	TypeStr      string
-	Status       string
-	Error        string
-	Granules     int
-	ReadRows     uint64
-	ReadMB       string
-	Duration     string
-	RowsReturned int
-	ExplainText  string
+	TaskID        int
+	Name          string
+	Description   string
+	Query         string
+	TypeStr       string
+	Status        string
+	Error         string
+	Granules      int
+	ReadRows      uint64
+	ReadMB        string
+	Duration      string
+	RowsReturned  int
+	ProjectionUsed bool
+	ExplainText   string
 }
 
 // reportData — данные для шаблона.
@@ -63,16 +65,18 @@ func WriteHTML(outputPath string, r *tests.RunResult, meta *ReportMeta) error {
 	rows := make([]rowView, 0, len(r.Results))
 	for _, res := range r.Results {
 		rv := rowView{
-			TaskID:       res.TaskID,
-			Name:         res.Name,
-			Description:  res.Description,
-			TypeStr:      string(res.Type),
-			Status:       rowStatus(res, meta),
-			Error:        res.Error,
-			Granules:     res.Granules,
-			ReadRows:     res.ReadRows,
-			RowsReturned: res.RowsReturned,
-			ExplainText:  res.ExplainText,
+			TaskID:         res.TaskID,
+			Name:           res.Name,
+			Description:    res.Description,
+			Query:          res.Query,
+			TypeStr:        string(res.Type),
+			Status:         rowStatus(res, meta),
+			Error:          res.Error,
+			Granules:       res.Granules,
+			ReadRows:       res.ReadRows,
+			RowsReturned:   res.RowsReturned,
+			ProjectionUsed: res.ProjectionUsed,
+			ExplainText:    res.ExplainText,
 		}
 		if res.ReadBytes > 0 {
 			rv.ReadMB = fmt.Sprintf("%.2f", float64(res.ReadBytes)/(1024*1024))
@@ -158,6 +162,13 @@ const reportTemplate = `<!DOCTYPE html>
     .status-fail { color: #dc2626; font-weight: 600; }
     .error { color: #dc2626; font-size: 0.85rem; max-width: 40em; }
     .explain { font-size: 0.8rem; white-space: pre-wrap; max-height: 8em; overflow: auto; background: #f9fafb; padding: 0.5rem; border-radius: 4px; }
+    .expand-btn { background: none; border: none; cursor: pointer; padding: 0.25rem; color: #6b7280; font-size: 0.75rem; }
+    .expand-btn:hover { color: #111; }
+    .detail-row { display: none; }
+    .detail-row.open { display: table-row; }
+    .detail-cell { padding: 0.75rem 1rem; background: #f9fafb; border-bottom: 1px solid #eee; vertical-align: top; }
+    .detail-cell .label { font-weight: 600; color: #4b5563; margin-bottom: 0.25rem; }
+    .detail-cell pre { margin: 0; font-size: 0.8125rem; white-space: pre-wrap; word-break: break-all; background: #fff; padding: 0.75rem; border-radius: 4px; border: 1px solid #e5e7eb; max-height: 12em; overflow: auto; }
   </style>
 </head>
 <body>
@@ -177,11 +188,12 @@ const reportTemplate = `<!DOCTYPE html>
   <table>
     <thead>
       <tr>
+        <th style="width:2rem;"></th>
         <th>#</th>
         <th>Name</th>
-        <th>Description</th>
         <th>Type</th>
         <th>Status</th>
+        <th>Projection</th>
         <th>Granules</th>
         <th>Read Rows</th>
         <th>Read MB</th>
@@ -193,11 +205,12 @@ const reportTemplate = `<!DOCTYPE html>
     <tbody>
       {{ range .Rows }}
       <tr>
+        <td><button type="button" class="expand-btn" data-task-id="{{ .TaskID }}" aria-label="Раскрыть">▶</button></td>
         <td>{{ .TaskID }}</td>
         <td>{{ safe .Name }}</td>
-        <td>{{ safe .Description }}</td>
         <td>{{ safe .TypeStr }}</td>
         <td><span class="status-{{ .Status }}">{{ .Status }}</span></td>
+        <td>{{ if eq .TypeStr "query" }}{{ if .ProjectionUsed }}yes{{ else }}no{{ end }}{{ else }}—{{ end }}</td>
         <td>{{ if eq .TypeStr "query" }}{{ .Granules }}{{ else }}—{{ end }}</td>
         <td>{{ if eq .TypeStr "query" }}{{ .ReadRows }}{{ else }}—{{ end }}</td>
         <td>{{ .ReadMB }}</td>
@@ -208,9 +221,28 @@ const reportTemplate = `<!DOCTYPE html>
           {{ if and (not .Error) .ExplainText }}<details><summary>EXPLAIN</summary><div class="explain">{{ safe .ExplainText }}</div></details>{{ end }}
         </td>
       </tr>
+      <tr class="detail-row" data-task-id="{{ .TaskID }}">
+        <td colspan="12" class="detail-cell">
+          {{ if .Description }}<div class="label">Описание</div><div>{{ safe .Description }}</div>{{ end }}
+          {{ if .Query }}{{ if .Description }}<div class="label" style="margin-top:0.75rem">SQL</div>{{ else }}<div class="label">SQL</div>{{ end }}<pre>{{ safe .Query }}</pre>{{ end }}
+          {{ if and (not .Description) (not .Query) }}—{{ end }}
+        </td>
+      </tr>
       {{ end }}
     </tbody>
   </table>
+  <script>
+    document.querySelectorAll('button.expand-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var id = btn.getAttribute('data-task-id');
+        var detailRow = document.querySelector('.detail-row[data-task-id="' + id + '"]');
+        if (!detailRow) return;
+        var isOpen = detailRow.classList.toggle('open');
+        btn.textContent = isOpen ? '▼' : '▶';
+        btn.setAttribute('aria-label', isOpen ? 'Свернуть' : 'Раскрыть');
+      });
+    });
+  </script>
 </body>
 </html>
 `

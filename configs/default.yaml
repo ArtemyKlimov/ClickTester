@@ -15,7 +15,7 @@ test_params:
   appName: "axdp-client-api"
   namespace: "dk5-axdp01-axdp-dev1-1"
   level: "INFO"
-  text_token: "error"
+  text_token: "headers"
 
 execution:
   workers: 4

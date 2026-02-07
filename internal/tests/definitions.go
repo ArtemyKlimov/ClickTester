@@ -25,20 +25,22 @@ type TaskOpts struct {
 	CollectStats   bool
 }
 
-// TestResult — результат выполнения одной задачи.
+// TestResult — результат выполнения одной задачи (поля с json для экспорта).
 type TestResult struct {
-	TaskID       int
-	Name         string
-	Description  string
-	Type         TaskType
-	Pass         bool
-	Error        string
-	Granules     int
-	ReadRows     uint64
-	ReadBytes    uint64
-	DurationMs   float64
-	RowsReturned int
-	ExplainText  string
+	TaskID         int     `json:"task_id"`
+	Name           string  `json:"name"`
+	Description    string  `json:"description"`
+	Type           TaskType `json:"type"`
+	Query          string  `json:"query"`
+	Pass           bool    `json:"pass"`
+	Error          string  `json:"error,omitempty"`
+	Granules       int     `json:"granules"`
+	ReadRows       uint64  `json:"read_rows"`
+	ReadBytes      uint64  `json:"read_bytes"`
+	DurationMs     float64 `json:"duration_ms"`
+	RowsReturned   int     `json:"rows_returned"`
+	ProjectionUsed bool    `json:"projection_used"` // по парсингу ExplainText
+	ExplainText    string  `json:"explain_text,omitempty"`
 }
 
 // RunResult — агрегированный результат прогона всех тестов.

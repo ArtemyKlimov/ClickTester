@@ -157,6 +157,11 @@ func (c *nativeClient) Close() error {
 // GranulesRegex — паттерн для строк вида "Granules: 123/456".
 var GranulesRegex = regexp.MustCompile(`Granules:\s*(\d+)/(\d+)`)
 
+// ProjectionUsed возвращает true, если в выводе EXPLAIN встречается упоминание проекции (Projection).
+func ProjectionUsed(explainText string) bool {
+	return strings.Contains(strings.ToLower(explainText), "projection")
+}
+
 // ExtractGranules извлекает минимальное число гранул (первое число в паре X/Y) из вывода EXPLAIN.
 func ExtractGranules(explainText string) int {
 	matches := GranulesRegex.FindAllStringSubmatch(explainText, -1)
