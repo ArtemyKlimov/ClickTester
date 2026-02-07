@@ -1,0 +1,23 @@
+# Binary
+clicktester
+clicktester.exe
+*.exe
+
+# Reports (generated)
+reports/*.html
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Env / secrets (do not commit credentials)
+.env
+.env.local
+*.local.yaml
+memory-bank/*
+# Go
+*.test
+coverage.out
