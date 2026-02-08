@@ -71,10 +71,10 @@ func RunStress(ctx context.Context, baseQuery string, workers int, queryTimeout 
 				var err error
 				if queryTimeout > 0 {
 					runCtx, cancel := context.WithTimeout(ctx, queryTimeout)
-					_, _, _, err = client.Query(runCtx, q)
+					_, _, _, _, err = client.Query(runCtx, q)
 					cancel()
 				} else {
-					_, _, _, err = client.Query(ctx, q)
+					_, _, _, _, err = client.Query(ctx, q)
 				}
 				durationMs := time.Since(t0).Seconds() * 1000
 				resultCh <- struct {

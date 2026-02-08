@@ -87,7 +87,7 @@ func runOne(ctx context.Context, t tests.Task, client chclient.Client, queryTime
 
 	switch t.Type {
 	case tests.TaskTypeStructure:
-		_, _, _, err := client.Query(ctx, t.Query)
+		_, _, _, _, err := client.Query(ctx, t.Query)
 		tr.Pass = err == nil
 		if err != nil {
 			tr.Error = err.Error()
@@ -105,7 +105,7 @@ func runOne(ctx context.Context, t tests.Task, client chclient.Client, queryTime
 		}
 
 		start := time.Now()
-		rows, readRows, readBytes, err := client.Query(ctx, t.Query)
+		rows, readRows, readBytes, stats, err := client.Query(ctx, t.Query)
 		tr.DurationMs = time.Since(start).Seconds() * 1000
 		if err != nil {
 			tr.Error = err.Error()
@@ -116,6 +116,15 @@ func runOne(ctx context.Context, t tests.Task, client chclient.Client, queryTime
 		tr.RowsReturned = rows
 		tr.ReadRows = readRows
 		tr.ReadBytes = readBytes
+		if stats != nil {
+			tr.QueryID = stats.QueryID
+			tr.MemoryUsage = stats.MemoryUsage
+			tr.Partitions = stats.Partitions
+			tr.PartitionDetails = make([]tests.PartitionInfo, 0, len(stats.PartitionDetails))
+			for _, d := range stats.PartitionDetails {
+				tr.PartitionDetails = append(tr.PartitionDetails, tests.PartitionInfo{Partition: d.Partition, Rows: d.Rows, Bytes: d.Bytes})
+			}
+		}
 	}
 
 	return tr

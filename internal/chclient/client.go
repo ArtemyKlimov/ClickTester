@@ -24,29 +24,49 @@ import (
 // Client интерфейс для выполнения запросов к ClickHouse.
 type Client interface {
 	Ping(ctx context.Context) error
-	Query(ctx context.Context, query string) (rows int, readRows, readBytes uint64, err error)
+	Query(ctx context.Context, query string) (rows int, readRows, readBytes uint64, stats *QueryStats, err error)
 	Explain(ctx context.Context, query string) (explainText string, err error)
 	Close() error
 }
 
 // ConnectOptions — параметры подключения (из конфига).
 type ConnectOptions struct {
-	Host          string
-	Port          int
-	Database      string
-	User          string
-	Password      string
-	Secure         bool   // использовать TLS
-	TLSSkipVerify  *bool  // не проверять сертификат (при secure по умолчанию true)
-	TLSCAFile      string // путь к PEM с CA (опционально)
-	TLSPfxFile     string // путь к PFX/P12 клиентскому сертификату (mTLS)
-	TLSPfxPassword string // пароль к PFX (опционально)
+	Host           string
+	Port           int
+	Database       string
+	User           string
+	Password       string
+	Table          string // для запроса system.parts по партициям из query_log (опционально)
+	Secure         bool
+	TLSSkipVerify  *bool
+	TLSCAFile      string
+	TLSPfxFile     string
+	TLSPfxPassword string
+}
+
+// PartitionInfo — сведения о партиции из system.parts (partition, rows, bytes).
+type PartitionInfo struct {
+	Partition string
+	Rows      uint64
+	Bytes     uint64
+}
+
+// QueryStats — метрики из query_log (и system.parts по партициям запроса).
+type QueryStats struct {
+	QueryID          string         // ID запроса для поиска в system.query_log
+	ReadRows         uint64
+	ReadBytes        uint64
+	MemoryUsage      uint64
+	Partitions       []string       // partition ID из query_log
+	PartitionDetails []PartitionInfo // строки/байты по каждой партиции из system.parts
 }
 
 // nativeClient — реализация Client через clickhouse-go/v2 (native или HTTP/HTTPS).
 type nativeClient struct {
 	conn    driver.Conn
-	useHTTP bool // при true Progress не приходит от драйвера; используем system.query_log для read_rows/read_bytes
+	useHTTP bool
+	db      string
+	table   string // для запроса system.parts по партициям
 }
 
 // Порты HTTP/HTTPS интерфейса ClickHouse (в отличие от native 9000/9440).
@@ -103,7 +123,7 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 		return nil, fmt.Errorf("clickhouse ping: %w", err)
 	}
 
-	return &nativeClient{conn: conn, useHTTP: useHTTP}, nil
+	return &nativeClient{conn: conn, useHTTP: useHTTP, db: opt.Database, table: opt.Table}, nil
 }
 
 // buildTLSConfig собирает tls.Config: CA для проверки сервера, опционально клиентский сертификат из PFX/P12.
@@ -155,7 +175,7 @@ func (c *nativeClient) Ping(ctx context.Context) error {
 // Query выполняет запрос и возвращает число строк результата, read_rows и read_bytes.
 // При native — из Progress; при HTTP/HTTPS — по query_id из system.query_log.
 // Для HTTP передаём свой query_id в URL (?query_id=...) через WithQueryID; драйвер добавляет его в запрос.
-func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readRows, readBytes uint64, err error) {
+func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readRows, readBytes uint64, stats *QueryStats, err error) {
 	queryID := generateQueryID()
 	var progressMu sync.Mutex
 	progressRows := uint64(0)
@@ -172,7 +192,7 @@ func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readR
 
 	rowIter, err := c.conn.Query(ctx, query)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, nil, err
 	}
 	defer func() { _ = rowIter.Close() }()
 
@@ -180,7 +200,7 @@ func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readR
 		rows++
 	}
 	if err = rowIter.Err(); err != nil {
-		return rows, 0, 0, err
+		return rows, 0, 0, nil, err
 	}
 
 	progressMu.Lock()
@@ -190,10 +210,18 @@ func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readR
 
 	if c.useHTTP && readRows == 0 && readBytes == 0 {
 		_ = rowIter.Close()
-		readRows, readBytes, _ = c.queryLogStats(ctx, queryID)
+		stats, _ = c.queryLogStats(ctx, queryID)
+		if stats != nil {
+			readRows = stats.ReadRows
+			readBytes = stats.ReadBytes
+		}
 	}
+	if stats == nil {
+		stats = &QueryStats{}
+	}
+	stats.QueryID = queryID
 
-	return rows, readRows, readBytes, nil
+	return rows, readRows, readBytes, stats, nil
 }
 
 func generateQueryID() string {
@@ -208,64 +236,116 @@ func mustRand(n int) []byte {
 	return b
 }
 
-// queryLogStats возвращает read_rows и read_bytes из system.query_log по query_id (для HTTP).
-// Для одной ноды: session_id + MaxOpenConns:1 держат запросы на одной ноде, SYSTEM FLUSH LOGS делает запись видимой.
-// Для кластера: при подключении к одной ноде — то же; при балансировщике — fallback по clusterAllReplicas.
-func (c *nativeClient) queryLogStats(ctx context.Context, queryID string) (readRows, readBytes uint64, err error) {
+// queryLogStats возвращает метрики из query_log (read_rows, read_bytes, memory_usage, partitions) и при заданной таблице — детали партиций из system.parts.
+func (c *nativeClient) queryLogStats(ctx context.Context, queryID string) (*QueryStats, error) {
 	bg, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	var lastErr error
-	tryQuery := func(q string) (uint64, uint64, bool) {
+	// read_rows, read_bytes, memory_usage, partitions (concat by tab)
+	qSelect := "SELECT read_rows, read_bytes, memory_usage, arrayStringConcat(partitions, '\\t') AS parts FROM system.query_log WHERE query_id = '%s' AND type = 2 LIMIT 1"
+
+	tryRow := func(q string) (r, b, mem uint64, partsStr string, ok bool) {
 		rowIter, qErr := c.conn.Query(bg, q)
 		if qErr != nil {
 			lastErr = qErr
-			return 0, 0, false
+			return 0, 0, 0, "", false
 		}
 		defer func() { _ = rowIter.Close() }()
 		if !rowIter.Next() {
 			lastErr = nil
-			return 0, 0, false
+			return 0, 0, 0, "", false
 		}
-		var r, b uint64
-		if qErr = rowIter.Scan(&r, &b); qErr != nil {
+		var parts string
+		if qErr = rowIter.Scan(&r, &b, &mem, &parts); qErr != nil {
 			lastErr = qErr
-			return 0, 0, false
+			return 0, 0, 0, "", false
 		}
 		lastErr = nil
-		return r, b, true
+		return r, b, mem, parts, true
 	}
 
 	_ = c.conn.Exec(bg, "SYSTEM FLUSH LOGS")
 
-	qLocal := fmt.Sprintf("SELECT read_rows, read_bytes FROM system.query_log WHERE query_id = '%s' AND type = 2 LIMIT 1", queryID)
+	qLocal := fmt.Sprintf(qSelect, queryID)
 	for _, d := range []time.Duration{0, 50 * time.Millisecond, 150 * time.Millisecond} {
 		if d > 0 {
 			time.Sleep(d)
 		}
-		if r, b, ok := tryQuery(qLocal); ok {
-			return r, b, nil
+		if r, b, mem, partsStr, ok := tryRow(qLocal); ok {
+			return c.buildStats(r, b, mem, partsStr), nil
 		}
 	}
 
-	// Кластер: при подключении через балансировщик запрос мог уйти на другую ноду; ищем по всем репликам
 	for _, clusterName := range []string{"default", "cluster"} {
-		q := fmt.Sprintf("SELECT read_rows, read_bytes FROM clusterAllReplicas('%s', system.query_log) WHERE query_id = '%s' AND type = 2 LIMIT 1 SETTINGS skip_unavailable_shards = 1", clusterName, queryID)
-		if r, b, ok := tryQuery(q); ok {
-			return r, b, nil
+		q := fmt.Sprintf("SELECT read_rows, read_bytes, memory_usage, arrayStringConcat(partitions, '\\t') AS parts FROM clusterAllReplicas('%s', system.query_log) WHERE query_id = '%s' AND type = 2 LIMIT 1 SETTINGS skip_unavailable_shards = 1", clusterName, queryID)
+		if r, b, mem, partsStr, ok := tryRow(q); ok {
+			return c.buildStats(r, b, mem, partsStr), nil
 		}
 	}
 
-	qLast := "SELECT read_rows, read_bytes FROM system.query_log WHERE user = currentUser() AND type = 2 AND event_time > now() - 10 AND position(query, 'system.query_log') = 0 ORDER BY event_time DESC LIMIT 1"
-	if r, b, ok := tryQuery(qLast); ok {
-		return r, b, nil
+	qLast := "SELECT read_rows, read_bytes, memory_usage, arrayStringConcat(partitions, '\\t') AS parts FROM system.query_log WHERE user = currentUser() AND type = 2 AND event_time > now() - 10 AND position(query, 'system.query_log') = 0 ORDER BY event_time DESC LIMIT 1"
+	if r, b, mem, partsStr, ok := tryRow(qLast); ok {
+		return c.buildStats(r, b, mem, partsStr), nil
 	}
 
 	if lastErr != nil {
 		log.Printf("[clicktester] HTTP: запрос к query_log: %v", lastErr)
 	}
 	log.Printf("[clicktester] HTTP: read_rows/read_bytes не получены (query_id=%s). Нужны: log_queries=1, права на system.query_log и при необходимости SYSTEM FLUSH LOGS.", queryID)
-	return 0, 0, nil
+	return nil, nil
+}
+
+func (c *nativeClient) buildStats(readRows, readBytes, memoryUsage uint64, partitionsConcat string) *QueryStats {
+	stats := &QueryStats{ReadRows: readRows, ReadBytes: readBytes, MemoryUsage: memoryUsage}
+	if partitionsConcat != "" {
+		stats.Partitions = strings.Split(partitionsConcat, "\t")
+	}
+	if c.table == "" || c.db == "" || len(stats.Partitions) == 0 {
+		return stats
+	}
+	// query_log.partitions может быть вида "database.table.7b85c6df..." — извлекаем partition_id (после последней точки) для поиска в system.parts
+	partitionIDs := make([]string, 0, len(stats.Partitions))
+	seen := make(map[string]struct{})
+	for _, p := range stats.Partitions {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// partition_id = часть после последней точки, иначе вся строка
+		pid := p
+		if idx := strings.LastIndex(p, "."); idx >= 0 && idx < len(p)-1 {
+			pid = p[idx+1:]
+		}
+		if pid == "" {
+			continue
+		}
+		if _, exists := seen[pid]; exists {
+			continue
+		}
+		seen[pid] = struct{}{}
+		partitionIDs = append(partitionIDs, "'"+strings.ReplaceAll(pid, "'", "''")+"'")
+	}
+	if len(partitionIDs) == 0 {
+		return stats
+	}
+	// В system.parts ищем по partition_id, возвращаем поле partition (значение партиции), rows, bytes
+	qParts := fmt.Sprintf("SELECT partition, sum(rows) AS r, sum(bytes_on_disk) AS b FROM system.parts WHERE database = '%s' AND table = '%s' AND partition_id IN (%s) AND active GROUP BY partition ORDER BY partition",
+		strings.ReplaceAll(c.db, "'", "''"), strings.ReplaceAll(c.table, "'", "''"), strings.Join(partitionIDs, ","))
+	rowIter, err := c.conn.Query(context.Background(), qParts)
+	if err != nil {
+		return stats
+	}
+	defer func() { _ = rowIter.Close() }()
+	for rowIter.Next() {
+		var part string
+		var r, b uint64
+		if rowIter.Scan(&part, &r, &b) != nil {
+			continue
+		}
+		stats.PartitionDetails = append(stats.PartitionDetails, PartitionInfo{Partition: part, Rows: r, Bytes: b})
+	}
+	return stats
 }
 
 // Explain выполняет EXPLAIN indexes=1 для запроса и возвращает текст вывода; из текста можно извлечь гранулы через ExtractGranules.

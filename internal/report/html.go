@@ -27,20 +27,24 @@ type ReportMeta struct {
 
 // rowView — одна строка таблицы с вычисленным статусом (все поля — примитивы для шаблона).
 type rowView struct {
-	TaskID        int
-	Name          string
-	Description   string
-	Query         string
-	TypeStr       string
-	Status        string
-	Error         string
-	Granules      int
-	ReadRows      uint64
-	ReadMB        string
-	Duration      string
-	RowsReturned  int
-	ProjectionUsed bool
-	ExplainText   string
+	TaskID          int
+	Name            string
+	Description     string
+	Query           string
+	TypeStr         string
+	Status          string
+	Error           string
+	Granules        int
+	ReadRows        uint64
+	ReadMB          string
+	MemoryUsage     string // отображаемое значение memory_usage (байты → MB или "—")
+	Duration        string
+	RowsReturned    int
+	ProjectionUsed  bool
+	ExplainText     string
+	QueryID          string
+	Partitions       []string
+	PartitionDetails []tests.PartitionInfo
 }
 
 // reportData — данные для шаблона.
@@ -65,18 +69,21 @@ func WriteHTML(outputPath string, r *tests.RunResult, meta *ReportMeta) error {
 	rows := make([]rowView, 0, len(r.Results))
 	for _, res := range r.Results {
 		rv := rowView{
-			TaskID:         res.TaskID,
-			Name:           res.Name,
-			Description:    res.Description,
-			Query:          res.Query,
-			TypeStr:        string(res.Type),
-			Status:         rowStatus(res, meta),
-			Error:          res.Error,
-			Granules:       res.Granules,
-			ReadRows:       res.ReadRows,
-			RowsReturned:   res.RowsReturned,
-			ProjectionUsed: res.ProjectionUsed,
-			ExplainText:    res.ExplainText,
+			TaskID:           res.TaskID,
+			Name:             res.Name,
+			Description:      res.Description,
+			Query:            res.Query,
+			TypeStr:          string(res.Type),
+			Status:           rowStatus(res, meta),
+			Error:            res.Error,
+			Granules:         res.Granules,
+			ReadRows:         res.ReadRows,
+			RowsReturned:     res.RowsReturned,
+			ProjectionUsed:   res.ProjectionUsed,
+			ExplainText:      res.ExplainText,
+			QueryID:          res.QueryID,
+			Partitions:       res.Partitions,
+			PartitionDetails: res.PartitionDetails,
 		}
 		if res.ReadBytes > 0 {
 			rv.ReadMB = fmt.Sprintf("%.2f", float64(res.ReadBytes)/(1024*1024))
@@ -84,6 +91,13 @@ func WriteHTML(outputPath string, r *tests.RunResult, meta *ReportMeta) error {
 			rv.ReadMB = "0.00"
 		} else {
 			rv.ReadMB = "—"
+		}
+		if res.MemoryUsage > 0 {
+			rv.MemoryUsage = fmt.Sprintf("%.2f", float64(res.MemoryUsage)/(1024*1024))
+		} else if string(res.Type) == "query" {
+			rv.MemoryUsage = "0.00"
+		} else {
+			rv.MemoryUsage = "—"
 		}
 		if res.DurationMs > 0 {
 			rv.Duration = fmt.Sprintf("%.2f", res.DurationMs)
@@ -169,6 +183,11 @@ const reportTemplate = `<!DOCTYPE html>
     .detail-cell { padding: 0.75rem 1rem; background: #f9fafb; border-bottom: 1px solid #eee; vertical-align: top; }
     .detail-cell .label { font-weight: 600; color: #4b5563; margin-bottom: 0.25rem; }
     .detail-cell pre { margin: 0; font-size: 0.8125rem; white-space: pre-wrap; word-break: break-all; background: #fff; padding: 0.75rem; border-radius: 4px; border: 1px solid #e5e7eb; max-height: 12em; overflow: auto; }
+    .detail-cell .parts-table { margin-top: 0.25rem; font-size: 0.8125rem; border-collapse: collapse; }
+    .detail-cell .parts-table th, .detail-cell .parts-table td { padding: 0.25rem 0.5rem; border: 1px solid #e5e7eb; }
+    .detail-cell .parts-table th { background: #f3f4f6; }
+    .query-id-hint { margin: 0.25rem 0 0 0; font-size: 0.8rem; color: #6b7280; }
+    .query-id-hint code { background: #f3f4f6; padding: 0.1rem 0.3rem; border-radius: 3px; }
   </style>
 </head>
 <body>
@@ -197,6 +216,7 @@ const reportTemplate = `<!DOCTYPE html>
         <th>Granules</th>
         <th>Read Rows</th>
         <th>Read MB</th>
+        <th>Memory (MB)</th>
         <th>Duration (ms)</th>
         <th>Rows</th>
         <th>Error / Details</th>
@@ -214,6 +234,7 @@ const reportTemplate = `<!DOCTYPE html>
         <td>{{ if eq .TypeStr "query" }}{{ .Granules }}{{ else }}—{{ end }}</td>
         <td>{{ if eq .TypeStr "query" }}{{ .ReadRows }}{{ else }}—{{ end }}</td>
         <td>{{ .ReadMB }}</td>
+        <td>{{ .MemoryUsage }}</td>
         <td>{{ .Duration }}</td>
         <td>{{ if eq .TypeStr "query" }}{{ .RowsReturned }}{{ else }}—{{ end }}</td>
         <td>
@@ -223,9 +244,24 @@ const reportTemplate = `<!DOCTYPE html>
       </tr>
       <tr class="detail-row" data-task-id="{{ .TaskID }}">
         <td colspan="12" class="detail-cell">
-          {{ if .Description }}<div class="label">Описание</div><div>{{ safe .Description }}</div>{{ end }}
-          {{ if .Query }}{{ if .Description }}<div class="label" style="margin-top:0.75rem">SQL</div>{{ else }}<div class="label">SQL</div>{{ end }}<pre>{{ safe .Query }}</pre>{{ end }}
-          {{ if and (not .Description) (not .Query) }}—{{ end }}
+          {{ if .QueryID }}<div class="label">Query ID</div><div><code>{{ safe .QueryID }}</code></div><p class="query-id-hint">Для поиска в БД: <code>SELECT * FROM system.query_log WHERE query_id = '{{ safe .QueryID }}'</code></p>{{ end }}
+          {{ if .Description }}<div class="label" {{ if .QueryID }}style="margin-top:0.75rem"{{ end }}>Описание</div><div>{{ safe .Description }}</div>{{ end }}
+          {{ if .Query }}{{ if or .QueryID .Description }}<div class="label" style="margin-top:0.75rem">SQL</div>{{ else }}<div class="label">SQL</div>{{ end }}<pre>{{ safe .Query }}</pre>{{ end }}
+          {{ if .PartitionDetails }}
+          <div class="label" style="margin-top:0.75rem">Партиции</div>
+          <table class="parts-table">
+            <thead><tr><th>Partition</th><th>Rows</th><th>Bytes</th></tr></thead>
+            <tbody>
+            {{ range .PartitionDetails }}
+            <tr><td>{{ safe .Partition }}</td><td>{{ .Rows }}</td><td>{{ .Bytes }}</td></tr>
+            {{ end }}
+            </tbody>
+          </table>
+          {{ else if .Partitions }}
+          <div class="label" style="margin-top:0.75rem">Партиции (query_log)</div>
+          <div>{{ range .Partitions }}{{ safe . }} {{ end }}</div>
+          {{ end }}
+          {{ if and (not .QueryID) (not .Description) (not .Query) (not .PartitionDetails) (not .Partitions) }}—{{ end }}
         </td>
       </tr>
       {{ end }}
