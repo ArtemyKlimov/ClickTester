@@ -4,12 +4,12 @@
 clickhouse:
   host: localhost
   # порт: 9000 — native, 9440 — native TLS; 8123 — HTTP, 8443 — HTTPS (HTTP + TLS)
-  port: 8443
+  port: 8123
   database: logs_db
   user: user
   password: password
   table_name: app_logs_v10
-  secure: true
+  secure: false
   # при secure: true — TLS. Опционально:
   # tls_skip_verify: true   — не проверять сертификат сервера (по умолчанию при secure)
   # tls_skip_verify: false  — проверять (системные CA или tls_ca_file)

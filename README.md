@@ -95,6 +95,7 @@ go build -o clicktester.exe ./cmd/clicktester
 
 - Метаданные запуска: дата, хост, БД, таблица, число воркеров, пороги.
 - Таблица результатов: №, Name, Type, Status (ok / warn / fail), **Projection** (yes/no по EXPLAIN), Granules, Read Rows, Read MB, Duration, Rows, Error или текст EXPLAIN. Строки можно раскрыть для просмотра описания и SQL.
+- **Read Rows / Read MB**: при подключении по **native** (порты 9000/9440) берутся из Progress; при **HTTP/HTTPS** (8123/8443) драйвер Progress не отдаёт — тогда значения подставляются из `system.query_log` по `query_id` (один дополнительный запрос после каждого теста).
 - При `-format json` или `-format both` дополнительно пишется JSON (по умолчанию рядом с HTML, расширение .json): метаданные и массив результатов с полями запроса (name, description, query) и метриками (pass, granules, read_rows, projection_used и т.д.).
 
 Статусы для запросов типа `query`:
@@ -122,12 +123,3 @@ ClickTester/
 ├── go.mod, go.sum
 └── README.md
 ```
-
-## Дальнейшие улучшения
-
-Идеи новых тестов (structure: ORDER BY, TTL, codecs, parts_count; query: по messageId/eventId/attributes/mdc), доработки отчёта, конфига, CLI и тестирования кода собраны в **[docs/improvements-proposal.md](docs/improvements-proposal.md)**.
-
-## Ссылки
-
-- Схема таблицы: `Create_db_v11.sql`
-- Примеры запросов и агрегаций: `benchmark-dso-config/application-new.yml`

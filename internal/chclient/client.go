@@ -3,10 +3,13 @@ package chclient
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 	"regexp"
 	"strings"
@@ -40,9 +43,10 @@ type ConnectOptions struct {
 	TLSPfxPassword string // пароль к PFX (опционально)
 }
 
-// nativeClient — реализация Client через clickhouse-go/v2 (native).
+// nativeClient — реализация Client через clickhouse-go/v2 (native или HTTP/HTTPS).
 type nativeClient struct {
-	conn driver.Conn
+	conn    driver.Conn
+	useHTTP bool // при true Progress не приходит от драйвера; используем system.query_log для read_rows/read_bytes
 }
 
 // Порты HTTP/HTTPS интерфейса ClickHouse (в отличие от native 9000/9440).
@@ -59,6 +63,11 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 	}
 	addr := fmt.Sprintf("%s:%d", opt.Host, opt.Port)
 
+	useHTTP := opt.Port == PortHTTP || opt.Port == PortHTTPS
+	maxOpen := 2
+	if useHTTP {
+		maxOpen = 1 // один контур: основной запрос и lookup в query_log на одной ноде (query_log локальный)
+	}
 	opts := &clickhouse.Options{
 		Addr: []string{addr},
 		Auth: clickhouse.Auth{
@@ -67,13 +76,13 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 			Password: opt.Password,
 		},
 		DialTimeout: 10 * time.Second,
-		MaxOpenConns: 2,
+		MaxOpenConns: maxOpen,
 		MaxIdleConns: 1,
 	}
 
-	useHTTP := opt.Port == PortHTTP || opt.Port == PortHTTPS
 	if useHTTP {
 		opts.Protocol = clickhouse.HTTP
+		opts.Settings = clickhouse.Settings{"session_id": "ct-" + hex.EncodeToString(mustRand(8))}
 	}
 
 	if opt.Secure || opt.Port == PortHTTPS {
@@ -94,7 +103,7 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 		return nil, fmt.Errorf("clickhouse ping: %w", err)
 	}
 
-	return &nativeClient{conn: conn}, nil
+	return &nativeClient{conn: conn, useHTTP: useHTTP}, nil
 }
 
 // buildTLSConfig собирает tls.Config: CA для проверки сервера, опционально клиентский сертификат из PFX/P12.
@@ -143,18 +152,23 @@ func (c *nativeClient) Ping(ctx context.Context) error {
 	return c.conn.Ping(ctx)
 }
 
-// Query выполняет запрос и возвращает число строк результата, read_rows и read_bytes (из Progress).
+// Query выполняет запрос и возвращает число строк результата, read_rows и read_bytes.
+// При native — из Progress; при HTTP/HTTPS — по query_id из system.query_log.
+// Для HTTP передаём свой query_id в URL (?query_id=...) через WithQueryID; драйвер добавляет его в запрос.
 func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readRows, readBytes uint64, err error) {
+	queryID := generateQueryID()
 	var progressMu sync.Mutex
 	progressRows := uint64(0)
 	progressBytes := uint64(0)
 
-	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(p *clickhouse.Progress) {
-		progressMu.Lock()
-		progressRows += p.Rows
-		progressBytes += p.Bytes
-		progressMu.Unlock()
-	}))
+	ctx = clickhouse.Context(ctx,
+		clickhouse.WithQueryID(queryID),
+		clickhouse.WithProgress(func(p *clickhouse.Progress) {
+			progressMu.Lock()
+			progressRows += p.Rows
+			progressBytes += p.Bytes
+			progressMu.Unlock()
+		}))
 
 	rowIter, err := c.conn.Query(ctx, query)
 	if err != nil {
@@ -174,7 +188,84 @@ func (c *nativeClient) Query(ctx context.Context, query string) (rows int, readR
 	readBytes = progressBytes
 	progressMu.Unlock()
 
+	if c.useHTTP && readRows == 0 && readBytes == 0 {
+		_ = rowIter.Close()
+		readRows, readBytes, _ = c.queryLogStats(ctx, queryID)
+	}
+
 	return rows, readRows, readBytes, nil
+}
+
+func generateQueryID() string {
+	return "ct-" + hex.EncodeToString(mustRand(16))
+}
+
+func mustRand(n int) []byte {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	}
+	return b
+}
+
+// queryLogStats возвращает read_rows и read_bytes из system.query_log по query_id (для HTTP).
+// Для одной ноды: session_id + MaxOpenConns:1 держат запросы на одной ноде, SYSTEM FLUSH LOGS делает запись видимой.
+// Для кластера: при подключении к одной ноде — то же; при балансировщике — fallback по clusterAllReplicas.
+func (c *nativeClient) queryLogStats(ctx context.Context, queryID string) (readRows, readBytes uint64, err error) {
+	bg, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	var lastErr error
+	tryQuery := func(q string) (uint64, uint64, bool) {
+		rowIter, qErr := c.conn.Query(bg, q)
+		if qErr != nil {
+			lastErr = qErr
+			return 0, 0, false
+		}
+		defer func() { _ = rowIter.Close() }()
+		if !rowIter.Next() {
+			lastErr = nil
+			return 0, 0, false
+		}
+		var r, b uint64
+		if qErr = rowIter.Scan(&r, &b); qErr != nil {
+			lastErr = qErr
+			return 0, 0, false
+		}
+		lastErr = nil
+		return r, b, true
+	}
+
+	_ = c.conn.Exec(bg, "SYSTEM FLUSH LOGS")
+
+	qLocal := fmt.Sprintf("SELECT read_rows, read_bytes FROM system.query_log WHERE query_id = '%s' AND type = 2 LIMIT 1", queryID)
+	for _, d := range []time.Duration{0, 50 * time.Millisecond, 150 * time.Millisecond} {
+		if d > 0 {
+			time.Sleep(d)
+		}
+		if r, b, ok := tryQuery(qLocal); ok {
+			return r, b, nil
+		}
+	}
+
+	// Кластер: при подключении через балансировщик запрос мог уйти на другую ноду; ищем по всем репликам
+	for _, clusterName := range []string{"default", "cluster"} {
+		q := fmt.Sprintf("SELECT read_rows, read_bytes FROM clusterAllReplicas('%s', system.query_log) WHERE query_id = '%s' AND type = 2 LIMIT 1 SETTINGS skip_unavailable_shards = 1", clusterName, queryID)
+		if r, b, ok := tryQuery(q); ok {
+			return r, b, nil
+		}
+	}
+
+	qLast := "SELECT read_rows, read_bytes FROM system.query_log WHERE user = currentUser() AND type = 2 AND event_time > now() - 10 AND position(query, 'system.query_log') = 0 ORDER BY event_time DESC LIMIT 1"
+	if r, b, ok := tryQuery(qLast); ok {
+		return r, b, nil
+	}
+
+	if lastErr != nil {
+		log.Printf("[clicktester] HTTP: запрос к query_log: %v", lastErr)
+	}
+	log.Printf("[clicktester] HTTP: read_rows/read_bytes не получены (query_id=%s). Нужны: log_queries=1, права на system.query_log и при необходимости SYSTEM FLUSH LOGS.", queryID)
+	return 0, 0, nil
 }
 
 // Explain выполняет EXPLAIN indexes=1 для запроса и возвращает текст вывода; из текста можно извлечь гранулы через ExtractGranules.
