@@ -4,7 +4,10 @@ package chclient
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
+	"golang.org/x/crypto/pkcs12"
 )
 
 // Client интерфейс для выполнения запросов к ClickHouse.
@@ -24,12 +28,16 @@ type Client interface {
 
 // ConnectOptions — параметры подключения (из конфига).
 type ConnectOptions struct {
-	Host     string
-	Port     int
-	Database string
-	User     string
-	Password string
-	Secure   bool
+	Host          string
+	Port          int
+	Database      string
+	User          string
+	Password      string
+	Secure         bool   // использовать TLS
+	TLSSkipVerify  *bool  // не проверять сертификат (при secure по умолчанию true)
+	TLSCAFile      string // путь к PEM с CA (опционально)
+	TLSPfxFile     string // путь к PFX/P12 клиентскому сертификату (mTLS)
+	TLSPfxPassword string // пароль к PFX (опционально)
 }
 
 // nativeClient — реализация Client через clickhouse-go/v2 (native).
@@ -37,7 +45,14 @@ type nativeClient struct {
 	conn driver.Conn
 }
 
+// Порты HTTP/HTTPS интерфейса ClickHouse (в отличие от native 9000/9440).
+const (
+	PortHTTP  = 8123
+	PortHTTPS = 8443
+)
+
 // New создаёт клиент и подключается к ClickHouse.
+// Для порта 8443 используется протокол HTTPS (HTTP + TLS), для 8123 — HTTP, иначе — native (9000/9440).
 func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 	if opt.Port == 0 {
 		opt.Port = 9000
@@ -55,8 +70,18 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 		MaxOpenConns: 2,
 		MaxIdleConns: 1,
 	}
-	if opt.Secure {
-		opts.TLS = &tls.Config{InsecureSkipVerify: true}
+
+	useHTTP := opt.Port == PortHTTP || opt.Port == PortHTTPS
+	if useHTTP {
+		opts.Protocol = clickhouse.HTTP
+	}
+
+	if opt.Secure || opt.Port == PortHTTPS {
+		tlsCfg, err := buildTLSConfig(opt.TLSSkipVerify, opt.TLSCAFile, opt.TLSPfxFile, opt.TLSPfxPassword)
+		if err != nil {
+			return nil, fmt.Errorf("tls: %w", err)
+		}
+		opts.TLS = tlsCfg
 	}
 
 	conn, err := clickhouse.Open(opts)
@@ -70,6 +95,47 @@ func New(ctx context.Context, opt ConnectOptions) (Client, error) {
 	}
 
 	return &nativeClient{conn: conn}, nil
+}
+
+// buildTLSConfig собирает tls.Config: CA для проверки сервера, опционально клиентский сертификат из PFX/P12.
+func buildTLSConfig(skipVerify *bool, caFile, pfxFile, pfxPassword string) (*tls.Config, error) {
+	insecure := skipVerify == nil || *skipVerify
+	cfg := &tls.Config{InsecureSkipVerify: insecure, MinVersion: tls.VersionTLS12}
+	if caFile != "" {
+		pem, err := os.ReadFile(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("read ca file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		pool.AppendCertsFromPEM(pem)
+		cfg.RootCAs = pool
+		cfg.InsecureSkipVerify = false
+	}
+	if pfxFile != "" {
+		pfxData, err := os.ReadFile(pfxFile)
+		if err != nil {
+			return nil, fmt.Errorf("read pfx file: %w", err)
+		}
+		cert, err := loadPFXAsTLSCert(pfxData, pfxPassword)
+		if err != nil {
+			return nil, fmt.Errorf("decode pfx: %w", err)
+		}
+		cfg.Certificates = []tls.Certificate{cert}
+	}
+	return cfg, nil
+}
+
+// loadPFXAsTLSCert загружает клиентский сертификат из PFX/P12 (поддерживает цепочки и несколько «мешков»).
+func loadPFXAsTLSCert(pfxData []byte, password string) (tls.Certificate, error) {
+	blocks, err := pkcs12.ToPEM(pfxData, password)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	var pemData []byte
+	for _, b := range blocks {
+		pemData = append(pemData, pem.EncodeToMemory(b)...)
+	}
+	return tls.X509KeyPair(pemData, pemData)
 }
 
 // Ping проверяет соединение.

@@ -3,6 +3,7 @@ package config
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"clicktester/internal/tests"
@@ -58,16 +59,42 @@ func BuildTasks(cfg *Config) ([]tests.Task, error) {
 	return out, nil
 }
 
+// StressQueryByName возвращает запрос для стресс-теста по имени шаблона (query_templates).
+// В возвращённой строке остаётся плейсхолдер $time_offset_ms$ для подстановки на каждый запрос.
+func StressQueryByName(cfg *Config, queryName string) (string, error) {
+	fullTable := cfg.ClickHouse.Database + "." + cfg.ClickHouse.TableName
+	for _, qt := range cfg.QueryTemplates {
+		if qt.Name == queryName {
+			return SubstituteQueryParamsForStress(qt.Query, fullTable, &cfg.TestParams), nil
+		}
+	}
+	return "", fmt.Errorf("query template %q not found", queryName)
+}
+
 // SubstituteQueryParams заменяет в запросе плейсхолдеры на значения из конфига.
 // fullTable — значение для $table_name$ (например "logs_db.app_logs_v10").
+// Для обычных тестов time_offset_ms подставляется из конфига (обычно 0).
 func SubstituteQueryParams(query, fullTable string, p *TestParams) string {
+	return substituteQueryParams(query, fullTable, p, true)
+}
+
+// SubstituteQueryParamsForStress подставляет все плейсхолдеры, кроме $time_offset_ms$
+// (остаётся в запросе для подстановки в раннере стресс-теста на каждый запрос).
+func SubstituteQueryParamsForStress(query, fullTable string, p *TestParams) string {
+	return substituteQueryParams(query, fullTable, p, false)
+}
+
+func substituteQueryParams(query, fullTable string, p *TestParams, includeTimeOffset bool) string {
 	repl := map[string]string{
-		"$table_name$": fullTable,
-		"$projectCode$": p.ProjectCode,
-		"$appName$":     p.AppName,
-		"$namespace$":  p.Namespace,
-		"$level$":      p.Level,
-		"$text_token$": p.TextToken,
+		"$table_name$":   fullTable,
+		"$projectCode$":  p.ProjectCode,
+		"$appName$":      p.AppName,
+		"$namespace$":    p.Namespace,
+		"$level$":        p.Level,
+		"$text_token$":   p.TextToken,
+	}
+	if includeTimeOffset {
+		repl["$time_offset_ms$"] = strconv.Itoa(p.TimeOffsetMs)
 	}
 	s := query
 	for k, v := range repl {

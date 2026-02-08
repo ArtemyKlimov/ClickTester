@@ -3,12 +3,19 @@
 
 clickhouse:
   host: localhost
-  port: 9000
+  # порт: 9000 — native, 9440 — native TLS; 8123 — HTTP, 8443 — HTTPS (HTTP + TLS)
+  port: 8443
   database: logs_db
   user: user
   password: password
   table_name: app_logs_v10
-  secure: false
+  secure: true
+  # при secure: true — TLS. Опционально:
+  # tls_skip_verify: true   — не проверять сертификат сервера (по умолчанию при secure)
+  # tls_skip_verify: false  — проверять (системные CA или tls_ca_file)
+  # tls_ca_file: /path/to/ca.pem  — PEM с CA для проверки сертификата (включает проверку)
+  tls_pfx_file: client.pfx # — клиентский сертификат PFX/P12 (mTLS)
+  tls_pfx_password: "qwe123"  # — пароль к PFX (если задан)
 
 test_params:
   projectCode: "AXDP"
@@ -16,6 +23,8 @@ test_params:
   namespace: "dk5-axdp01-axdp-dev1-1"
   level: "INFO"
   text_token: "headers"
+  # для обычных тестов подставляется в шаблоны с $time_offset_ms$ (обычно 0); в стресс-тесте не используется — там счётчик 0,1,2,…
+  time_offset_ms: 1
 
 execution:
   workers: 4
@@ -27,6 +36,12 @@ report:
     granules_warn: 500
     granules_fail: 2000
     read_rows_warn: 1000000
+
+# Стресс-тест: -stress — N минут в N потоков один запрос; время сдвигается на $time_offset_ms$ мс каждый раз (обход кэша).
+stress_test:
+  duration_minutes: 1
+  workers: 30
+  query_name: stress_15m_project
 
 structure_checks:
   - name: partitions
@@ -43,6 +58,12 @@ structure_checks:
     description: "Проверка настроек гранул (SHOW CREATE TABLE)."
 
 query_templates:
+  # --- Шаблон для стресс-теста (должен содержать $time_offset_ms$ для сдвига времени на каждый запрос) ---
+  - name: stress_15m_project
+    description: "Стресс: выборка по проекту за 15 мин; смещение времени на $time_offset_ms$ мс (обход кэша)."
+    query: "SELECT * FROM (SELECT * FROM $table_name$ WHERE mainTimestampTime >= now() - INTERVAL 15 MINUTE - toIntervalMillisecond($time_offset_ms$) AND projectCode = '$projectCode$' ORDER BY mainTimestampTime DESC LIMIT 500) ORDER BY localTime DESC"
+    collect_explain: false
+    collect_stats: true
   # --- 15 MINUTE, SELECT LIMIT 500 ---
   - name: q_15m_project
     description: "Выборка по проекту за 15 мин, ORDER BY mainTimestampTime, LIMIT 500."

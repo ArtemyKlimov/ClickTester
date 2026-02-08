@@ -5,7 +5,7 @@
 ## Требования
 
 - **Go 1.24+** (см. `go.mod`)
-- **ClickHouse** с нативным протоколом (порт 9000 по умолчанию)
+- **ClickHouse** (поддерживаются native 9000/9440 и HTTP/HTTPS 8123/8443)
 
 ## Быстрый старт
 
@@ -18,6 +18,9 @@ go build -o clicktester.exe ./cmd/clicktester
 
 # Режим сервера: браузер со списком тестов, запуск всех или по одному
 .\clicktester.exe -serve -config configs/default.yaml -port 8080
+
+# Стресс-тест 5 мин, 10 потоков (запрос из stress_test.query_name в конфиге)
+.\clicktester.exe -stress -config configs/default.yaml
 
 # Переопределение числа воркеров и пути отчёта
 .\clicktester.exe -config configs/default.yaml -workers 8 -output reports/run.html
@@ -33,12 +36,13 @@ go build -o clicktester.exe ./cmd/clicktester
 
 | Секция | Назначение |
 |--------|------------|
-| `clickhouse` | Подключение: `host`, `port` (9000 — native), `database`, `user`, `password`, `table_name`, `secure` |
+| `clickhouse` | Подключение: `host`, `port` (9000 — native, 9440 — native TLS; 8123 — HTTP, 8443 — HTTPS), `database`, `user`, `password`, `table_name`, `secure` (TLS). При `secure: true` опционально: `tls_skip_verify`, `tls_ca_file` (PEM с CA), `tls_pfx_file` (клиентский сертификат PFX/P12 для mTLS), `tls_pfx_password` |
 | `test_params` | Параметры для подстановки в шаблоны запросов: `projectCode`, `appName`, `namespace`, `level`, `text_token` |
 | `execution` | `workers` — число параллельных воркеров, `query_timeout_sec` — таймаут запроса (сек) |
 | `report` | `output_path` — путь к HTML-отчёту; `thresholds` — пороги для статусов warn/fail |
+| `stress_test` | Опционально: `duration_minutes`, `workers`, `query_name` — для режима `-stress` |
 | `structure_checks` | Список структурных проверок (партиции, индексы, проекции, настройки гранул) |
-| `query_templates` | Список шаблонов запросов с подстановкой параметров |
+| `query_templates` | Список шаблонов запросов с подстановкой параметров (для стресса — шаблон с `$time_offset_ms$`) |
 
 ### Плейсхолдеры в запросах
 
@@ -46,6 +50,7 @@ go build -o clicktester.exe ./cmd/clicktester
 
 - `$table_name$` → `database.table_name`
 - `$projectCode$`, `$appName$`, `$namespace$`, `$level$`, `$text_token$` → значения из `test_params`
+- `$time_offset_ms$` → в обычных тестах 0; в стресс-тесте подставляется на каждый запрос (1, 2, 3, …) для обхода кэша
 
 ### Структурные проверки (`structure_checks`)
 
@@ -69,10 +74,20 @@ go build -o clicktester.exe ./cmd/clicktester
 | `-workers` | Число воркеров (0 = из конфига) | 0 |
 | `-output` | Путь к HTML-отчёту (переопределяет конфиг) | — |
 | `-format` | Формат вывода: `html`, `json` или `both` (при `both` пишутся HTML и JSON) | html |
+| `-stress` | Запустить стресс-тест (N мин, N потоков, один запрос с меняющимся временем) | false |
 | `-serve` | Запустить HTTP-сервер и открыть браузер со списком тестов | false |
 | `-port` | Порт HTTP-сервера (при `-serve`) | 8080 |
 
 При `-serve` приложение поднимает веб-интерфейс: список тестов из конфига, кнопка «Запустить все» и «Запустить» у каждого теста. Результаты (статус, время, гранулы, read rows, ошибка) отображаются в таблице. Остановка — Ctrl+C.
+
+**Стресс-тест (`-stress`)** — в течение N минут в N потоков выполняется один выбранный запрос. В шаблоне запроса должен быть плейсхолдер `$time_offset_ms$` (например, `... - toIntervalMillisecond($time_offset_ms$) ...`); на каждый запрос он заменяется на новое значение (0, 1, 2, …), чтобы запрос не кэшировался. Цель — проверить деградацию БД под нагрузкой. В конфиге задаётся секция `stress_test`: `duration_minutes`, `workers`, `query_name` (имя из `query_templates`). В выводе: total, success, failed, cancelled, QPS, латентности **p50/p95/p99** (мс), примеры ошибок.
+
+**Как читать перцентили латентности:**
+- **p50 (медиана)** — у половины запросов время ответа было не больше этого значения (мс). Отражает «типичную» задержку.
+- **p95** — у 95% запросов задержка была не больше этого значения. Показывает «хвост»: редкие тяжёлые ответы.
+- **p99** — у 99% запросов задержка не больше этого значения. Сильнее всего реагирует на всплески и конкуренцию за ресурсы.
+
+Чем выше p95 и p99 относительно p50, тем больше разброс: часть запросов выполняется заметно дольше. Рост p95/p99 при увеличении числа воркеров при том же QPS говорит о росте очередей и конкуренции за БД.
 
 ## HTML-отчёт
 

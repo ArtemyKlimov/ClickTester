@@ -10,32 +10,45 @@ import (
 
 // Config — корневая структура конфигурации.
 type Config struct {
-	ClickHouse     ClickHouse     `yaml:"clickhouse"`
-	TestParams     TestParams     `yaml:"test_params"`
-	Execution      Execution     `yaml:"execution"`
-	Report         Report        `yaml:"report"`
+	ClickHouse      ClickHouse      `yaml:"clickhouse"`
+	TestParams      TestParams      `yaml:"test_params"`
+	Execution       Execution      `yaml:"execution"`
+	Report          Report         `yaml:"report"`
+	StressTest      *StressTest    `yaml:"stress_test"`
 	StructureChecks []StructureCheck `yaml:"structure_checks"`
 	QueryTemplates []QueryTemplate `yaml:"query_templates"`
 }
 
+// StressTest — параметры стресс-теста: N минут, N потоков, один шаблон запроса с меняющимся смещением времени.
+type StressTest struct {
+	DurationMinutes int    `yaml:"duration_minutes"` // длительность в минутах
+	Workers         int    `yaml:"workers"`         // число горутин (0 = из execution.workers)
+	QueryName       string `yaml:"query_name"`      // name из query_templates (в шаблоне должен быть $time_offset_ms$)
+}
+
 // ClickHouse — параметры подключения к ClickHouse.
 type ClickHouse struct {
-	Host      string `yaml:"host"`
-	Port      int    `yaml:"port"`
-	Database  string `yaml:"database"`
-	User      string `yaml:"user"`
-	Password  string `yaml:"password"`
-	TableName string `yaml:"table_name"`
-	Secure    bool   `yaml:"secure"`
+	Host          string `yaml:"host"`
+	Port          int    `yaml:"port"`
+	Database      string `yaml:"database"`
+	User          string `yaml:"user"`
+	Password      string `yaml:"password"`
+	TableName     string `yaml:"table_name"`
+	Secure        bool   `yaml:"secure"`             // использовать TLS
+	TLSSkipVerify *bool  `yaml:"tls_skip_verify"`    // не проверять сертификат сервера (при secure по умолчанию true)
+	TLSCAFile     string `yaml:"tls_ca_file"`        // путь к PEM с CA для проверки сертификата (опционально)
+	TLSPfxFile    string `yaml:"tls_pfx_file"`       // путь к клиентскому сертификату PFX/P12 (mTLS)
+	TLSPfxPassword string `yaml:"tls_pfx_password"`  // пароль к PFX (опционально)
 }
 
 // TestParams — параметры для подстановки в шаблоны запросов.
 type TestParams struct {
-	ProjectCode string `yaml:"projectCode"`
-	AppName     string `yaml:"appName"`
-	Namespace   string `yaml:"namespace"`
-	Level       string `yaml:"level"`
-	TextToken   string `yaml:"text_token"`
+	ProjectCode  string `yaml:"projectCode"`
+	AppName      string `yaml:"appName"`
+	Namespace    string `yaml:"namespace"`
+	Level        string `yaml:"level"`
+	TextToken    string `yaml:"text_token"`
+	TimeOffsetMs int    `yaml:"time_offset_ms"` // для обычных запусков = 0; в стресс-тесте подставляется по запросу
 }
 
 // Execution — параметры выполнения тестов.
@@ -115,5 +128,8 @@ func setDefaults(c *Config) {
 	}
 	if c.Report.OutputPath == "" {
 		c.Report.OutputPath = "reports/report.html"
+	}
+	if c.StressTest != nil && c.StressTest.Workers <= 0 {
+		c.StressTest.Workers = c.Execution.Workers
 	}
 }
